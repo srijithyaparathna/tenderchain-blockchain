@@ -1,0 +1,316 @@
+# TenderChain (Module 26) — Event Schema & Integration Guide
+
+Audience: procurement portal teams, audit/probity tooling, bidder front ends and
+agency front ends. Companion to the Module 26 work assignment; this document
+records what the pallet as built actually emits and expects.
+
+Pallet index in the runtime: **8** (`TenderChain`). Source:
+`pallets/tender-chain/`.
+
+---
+
+## 1. Reconstructing a tender from events alone
+
+Spec §9 requires that an independent observer be able to rebuild the whole
+trail from events and state. Every lifecycle fact is emitted; nothing that
+matters to probity is inferable only from a storage diff.
+
+The minimal reconstruction is: filter all events by `tender_id`, order by
+`(block_number, extrinsic_index)`, and fold:
+
+```
+TenderCreated        -> Draft
+TenderPublished      -> QaWindow          (close_block is now locked)
+SubmissionOpened     -> Submission        (Q&A closed; wheel-emitted)
+TenderClosed         -> Closed            (emitted by the deadline wheel)
+OpeningStarted       -> Opening           (participants count becomes public)
+EvaluationStarted    -> Evaluation        (emitted by the deadline wheel)
+Awarded              -> Awarded
+StandstillOpened     -> standstill running until standstill_end
+ChallengeLodged      -> Challenged        (execution suspended)
+ChallengeResolved    -> back to Awarded, or remitted
+ContractExecuted     -> Contracted
+TenderCancelled      -> Cancelled         (terminal)
+```
+
+Every transition is event-backed, including the questions-close gate, which
+emits `SubmissionOpened`. A tender's full lifecycle is reconstructible from
+events alone.
+
+`TenderClosed`, `EvaluationStarted` and `StandstillClosed` originate in
+`on_initialize`, **not** in an extrinsic. Indexers that only scan extrinsic
+events will miss the three transitions that prove the chain — not an official —
+closed the tender. Scan block events too.
+
+## 2. Event schema
+
+Field types: `tender_id` is `u32`; `panel_id` is `u32`; `Hash256` is a 32-byte
+blake2-256 content commitment (hex, DNC-resolvable); `block` is `BlockNumber`;
+`amount` is `Balance`.
+
+### Publication and rules
+
+| Event | Fields | Meaning for the record |
+|---|---|---|
+| `TenderCreated` | `tender_id`, `officer` | Draft exists. Nothing is locked yet. |
+| `TenderPublished` | `tender_id`, `entity`, `close_block` | **The lock point.** From this block criteria hash, weights, gates and eligibility are immutable. `close_block` is the consensus submission deadline. |
+| `AddendumPublished` | `tender_id`, `content_hash`, `extended_close_to` | A clarification or change. `extended_close_to` is `Some` only when the close moved — and it can only ever move later. |
+| `QuestionAsked` | `tender_id`, `question_id` | Omits the asker. Whether authorship is resolvable at all depends on the tender's `blind_questions` policy — see §3a. |
+| `QuestionAnswered` | `tender_id`, `question_id` | Answers publish to everyone at once; there is no private-clarification call. |
+
+### Submission and opening
+
+| Event | Fields | Meaning for the record |
+|---|---|---|
+| `BidCommitted` | `tender_id`, `bidder`, `block` | Consensus proof a bid existed before close. The content is not readable — only `blake2_256(bidder ‖ documents ‖ prices ‖ salt)` is on chain. |
+| `CommitmentWithdrawn` | `tender_id`, `bidder` | Pre-close withdrawal. Pair with `BondReturned`/`BondForfeited` to see bond treatment. |
+| `TenderClosed` | `tender_id` | Wheel-emitted. The block gate closed submissions. |
+| `OpeningStarted` | `tender_id`, `participants` | Participation count becomes public at opening, not before. |
+| `BidRevealed` | `tender_id`, `bidder`, `valid` | Emitted for every reveal, valid or not. |
+| `RevealMismatch` | `tender_id`, `bidder` | Revealed content did not hash to the commitment. The bid is voided but **stays on the public record** — it is never silently dropped. Always accompanied by `BidRevealed { valid: false }`. |
+
+### Evaluation
+
+| Event | Fields | Meaning for the record |
+|---|---|---|
+| `EvaluationStarted` | `tender_id` | Wheel-emitted at the end of the opening window. |
+| `EvaluatorAppointed` | `tender_id`, `evaluator` | Appointed, but cannot score yet. |
+| `ConflictDeclared` | `tender_id`, `evaluator` | Conflict-of-interest declaration lodged (hash in `EvaluatorSet`). |
+| `EvaluatorActivated` | `tender_id`, `evaluator` | Scoring rights live. Cannot occur before `ConflictDeclared`. |
+| `ScoresSubmitted` | `tender_id`, `evaluator`, `bidder` | Attribution. Per-criterion values are in the `Scores` map, keyed by the same triple. |
+| `ScoreVarianceFlagged` | `tender_id`, `bidder`, `criterion_id`, `spread` | **Probity signal.** Two evaluators differed by more than the configured threshold. Emitted once per disagreeing pair per criterion, at the moment the later sheet is submitted. Route to probity observers and to Sentinel (Module 19). |
+
+### Award, challenge, delivery
+
+| Event | Fields | Meaning for the record |
+|---|---|---|
+| `Awarded` | `tender_id`, `awardee`, `rationale_hash` | One event **per awardee** — a panel award emits several. Full ranking is in `Outcomes`. |
+| `StandstillOpened` | `tender_id`, `standstill_end` | Challenge window runs until `standstill_end` inclusive. |
+| `StandstillClosed` | `tender_id` | Wheel-emitted. `execute_award` becomes callable. |
+| `ChallengeLodged` | `tender_id`, `challenge_id`, `challenger` | Execution suspends immediately. |
+| `ChallengeResolved` | `tender_id`, `challenge_id`, `state` | `state` is `Dismissed` (execution may proceed) or `Upheld` (remitted to re-evaluation or cancellation). |
+| `ContractExecuted` | `tender_id`, `contract_hash` | Contract notarised. |
+| `DeliveryInstantiated` | `tender_id`, `awardee`, `delivery_project` | One per awardee. `delivery_project` is the Module 25 reference (spec §4.2 names it on the execution event; it is split out here because a panel award has several awardees). `None` while Work Task is stubbed. |
+| `ShortlistPublished` | `tender_id`, `suppliers` | An EOI closed stage one. Those suppliers can now bid on an RFT created with `shortlist_from` pointing at this tender. |
+| `PanelMemberAdmitted` | `panel_id`, `supplier` | Panel/standing-offer award admitted a supplier to the pool. |
+| `CallOffPlaced` | `panel_id`, `supplier`, `order_hash` | An order against a standing offer. |
+| `BondReturned` / `BondForfeited` | `tender_id`, `bidder`, `amount` | Bond settlement. Returns happen automatically on execute and on cancellation. |
+| `TenderCancelled` | `tender_id`, `reason_hash` | Terminal, and the reason is permanently public — silent cancellation is not possible. |
+
+### Panel id derivation
+
+A panel is established by the tender that awarded it: `panel_id == tender_id` of
+the establishing `Panel` tender. `PanelMemberAdmitted` therefore correlates with
+that tender's `Awarded` events in the same block.
+
+## 3a. Question authorship and blinding
+
+Chain state is world-readable, so omitting the asker from an event is not
+blinding — anyone can read the storage map. The tender therefore carries a
+`blind_questions` flag set at creation and locked at publication:
+
+- **`blind_questions: false`** — `QaRecord.author` is `Open(AccountId)`.
+  Authorship is public, as on most government tenders.
+- **`blind_questions: true`** — `QaRecord.author` is
+  `Blinded(blake2_256(asker ‖ salt))`. The account is never written to storage.
+  The asker passes their `author_salt` to `ask_question` and keeps it; they can
+  later reproduce the hash to prove authorship to a probity observer, and nobody
+  else can invert it.
+
+`Pallet::blind_author` is the canonical hasher, so a front end can reproduce it
+off-chain. A blinded tender gives up the ability to prove *non*-authorship, and
+loses authorship entirely if the salt is lost — treat the salt like the bid salt.
+
+## 3b. Multi-stage: EOI to RFT
+
+Stage one is a `TenderKind::Eoi` tender run like any other through to
+`Evaluation`. The officer then calls `publish_shortlist(eoi_id, suppliers)`;
+only suppliers with a valid reveal on that EOI may be listed, and the EOI moves
+to the terminal `Shortlisted` state.
+
+Stage two is an ordinary RFT created with `shortlist_from: Some(eoi_id)`. That
+link is written at creation and locked at publication alongside criteria and
+gates, so the shortlist a tender draws from cannot be swapped once bidding is
+under way. `commit_bid` then rejects anyone not on the list with
+`NotShortlisted`.
+
+## 3. Bidder front-end guide
+
+### Computing a commitment
+
+The commitment preimage is exact and includes the bidder's own account, so a
+rival cannot lift a commitment and replay it as theirs:
+
+```
+commitment = blake2_256( SCALE(bidder_account_id)
+                       ‖ documents_hash            (32 bytes)
+                       ‖ SCALE(price_schedule)     (BoundedVec<PriceLine>)
+                       ‖ salt )                    (32 bytes)
+```
+
+`PriceLine` is `{ item_id: u32, amount: Balance }`. The price schedule must be
+SCALE-encoded **as the `BoundedVec` it becomes on chain**, in the same order
+that will later be passed to `reveal_bid`. Reordering the lines changes the
+hash and voids the bid. `Pallet::compute_commitment` is the canonical
+implementation; front ends must match it byte for byte.
+
+Generate a fresh random `salt` per bid and store it with the documents. **Losing
+the salt makes the bid unrevealable**, which forfeits the bond when
+`forfeit_on_non_reveal` is set.
+
+### Sealed vs open
+
+The tender's `bid_mode` decides which call you use, and they are not
+interchangeable — the wrong one returns `WrongBidMode`.
+
+- **`BidMode::Sealed`** — `commit_bid` then `reveal_bid`, as below.
+- **`BidMode::Open`** (RFQs only) — a single `submit_open_bid(tender_id,
+  documents_hash, price_schedule)`. The content is recorded and readable
+  immediately, so everyone sees the same thing at the same time. There is no
+  hash to compute, no salt to keep, and no reveal step; the bid is stored as
+  already-revealed, so it can never be forfeited as a non-reveal.
+
+### Submission sequence
+
+1. `commit_bid(tender_id, commitment_hash)` before `close_block`. The bond is
+   reserved on the bidder's own account — never transferred away — so an
+   un-forfeited bond never leaves the bidder's custody.
+2. Wait for `OpeningStarted`.
+3. `reveal_bid(tender_id, documents_hash, price_schedule, salt)` inside the
+   opening window, with byte-identical inputs.
+
+A reveal outside the window fails with `RevealWindowClosed`; the bid is then
+treated as a non-reveal and the bond is forfeited if the terms say so. Front
+ends should surface the opening window as a hard countdown, not a soft reminder.
+
+**A mismatching reveal succeeds as a transaction.** `reveal_bid` does not error
+on a hash mismatch — it writes the reveal with `valid: false`, emits
+`RevealMismatch`, and returns `Ok`. A front end that only checks for extrinsic
+failure will report a voided bid as accepted. Check the emitted events, not the
+dispatch result. (The pallet declares an unused `RevealMismatch` *error*
+variant that shares the event's name; it is never returned, and it is the event
+that carries the meaning.)
+
+### Errors worth handling explicitly
+
+| Error | Front-end handling |
+|---|---|
+| `SubmissionClosed` | The block gate closed the tender. Not recoverable — do not offer a retry. |
+| `NotEligible` | The bidder lacks a required credential or the reputation floor. Link to Module 15 credential remediation. |
+| `CommitmentExists` | One commitment per bidder per tender; offer `withdraw_commitment` instead. |
+| `TooManyQuestions` | The tender hit `MaxQuestions`. Disable the ask-a-question control. |
+| `NotShortlisted` | This RFT draws from an EOI shortlist and the bidder is not on it. |
+| `EvaluatorIsBidder` | The account is on this tender's evaluation panel and so cannot bid on it. |
+| `WrongBidMode` | Sealed call on an open tender, or vice versa. Read `bid_mode` and route accordingly. |
+| `AlreadyRevealed` | Reveals are once-only. |
+| `TooManyPriceLines` | Exceeds `MaxPriceLines`; validate before submitting. |
+
+## 4. Agency front-end guide
+
+### Lifecycle calls the officer drives
+
+`create_tender` → `publish_tender` → (`answer_question`, `publish_addendum`) →
+`open_tender` (after the close block) → `appoint_evaluator` /
+`activate_evaluator` → [award by governed origin] → `execute_award` (after
+standstill).
+
+The officer does **not** close the tender or start evaluation — the deadline
+wheel does. A portal that shows a "close tender" button is misrepresenting the
+system.
+
+### Validation to enforce before submitting `create_tender`
+
+- Criterion weights must sum to exactly 100, else `WeightsInvalid`.
+- Gates must satisfy
+  `publish_at < questions_close_at < submission_close_at <= opening_at < opening_end_at`,
+  else `GateOrderInvalid`.
+- `publish_tender` must be called while `now < questions_close_at` — a draft
+  that misses its own Q&A window can never be published.
+- `BidMode::Open` is only valid for `TenderKind::Rfq` (`OpenBidNotPermitted`).
+
+### Things the API deliberately does not allow
+
+There is no extrinsic to amend criteria, weights or eligibility after
+publication, and none to shorten a submission window. These are absent from the
+API rather than blocked by a permission check, so a portal cannot expose them
+and should not imply they exist. An addendum may extend the close block only.
+
+### Panel call-offs
+
+`call_off` is an officer call, authorised against the officer of the tender that
+established the panel (`PanelTender` maps panel id to that tender). A signed
+account that is not that officer or entity gets `NotOfficer`.
+
+### Award authority
+
+`award` is gated on `AwardOrigin`, which spec §8 requires be a governed origin.
+In the current runtime this is `EnsureRoot` as a stand-in; it must be repointed
+at Module 16 (Multisig) or the deployment's governance origin before production.
+Agency front ends should drive awards through the governance flow, not a signed
+officer call.
+
+## 5. Audit / probity tooling guide
+
+Everything below is answerable from public data with no privileged access.
+
+- **Were the rules fixed before bids arrived?** Take the `TenderPublished` block
+  as the lock point; the criteria hash and weights read from `Tenders` are the
+  published ones, and no extrinsic exists that could have changed them since.
+  Every `AddendumPublished` is itself timestamped and public.
+- **Did any bid arrive late?** Compare each `BidCommitted.block` against
+  `TenderPublished.close_block`. The runtime rejects late commits, so a
+  violation would be an event that cannot exist — which is the point.
+- **Was anything readable before opening?** No. Only commitment hashes are
+  stored before the reveal window.
+- **Who evaluated, and did they declare?** `EvaluatorActivated` cannot precede
+  `ConflictDeclared` for the same evaluator. Scores are attributed by the
+  `Scores` key triple.
+- **Was there disagreement?** Every `ScoreVarianceFlagged` event, with the
+  criterion and the spread.
+- **Does the ranking follow the locked weights?** Recompute: per criterion,
+  average the scores across evaluators (integer division), multiply by
+  `weight_percent`, sum. Compare against `Outcomes.ranking`. Voided and
+  non-revealed bids are excluded from the ranking by construction.
+- **Did delivery follow?** `ContractExecuted` carries the notarised contract
+  hash and `DeliveryInstantiated` the Module 25 project reference per awardee.
+- **Were the roles separated?** No account appears both in this tender's
+  `EvaluatorSet` and its `BidCommitments`, and neither the officer nor the
+  entity sits on the panel — the runtime rejects both (spec §1.2).
+- **Could the officer have pocketed the bonds?** No. Forfeiture on non-reveal
+  only applies if the tender actually reached `Opening`; if the officer never
+  opened it, every bond is returned. And the officer cannot open so late that
+  the reveal window falls below `MinRevealWindow`.
+
+## 5a. Challenge standing and bounds
+
+`lodge_challenge` is restricted to accounts that lodged a commitment on that
+tender (`NotAParticipant` otherwise). This matters because every open challenge
+suspends `execute_award`: without the restriction any account could hold a
+lawful award hostage indefinitely. Challenges are additionally capped at
+`MaxChallenges` per tender, so the suspension window is bounded even from a
+bidder with standing.
+
+Questions are capped at `MaxQuestions` and evaluators at `MaxEvaluators` per
+tender. Re-appointing an evaluator already on the panel refreshes their record
+rather than consuming a slot — and, because re-appointment clears the conflict
+declaration and deactivates them, it also decrements the activated tally that
+`MinEvaluators` is checked against.
+
+## 6. Integration seams not yet wired
+
+The pallet is complete and self-contained, but Modules 2/8/10/13/15/16/19/25 do
+not exist in this runtime yet. Two trait seams carry permissive no-op `()`
+implementations, and swapping them is a change to the runtime `Config` impl
+only — no pallet logic changes:
+
+| Seam | Trait | Currently | Should become |
+|---|---|---|---|
+| Bidder eligibility | `EligibilityProvider` | `()` — everyone eligible | Module 15 (Identity) credentials + Module 10 (Reputation) score |
+| Award-to-delivery | `DeliveryInstantiator` | `()` — award recorded, no delivery project | Module 25 (Work Task) instantiation |
+| Bid bonds | `ReservableCurrency` | Balances reserve/unreserve | Module 8 (Escrow) |
+| Award authority | `AwardOrigin` | `EnsureRoot` | Module 16 (Multisig) / governance |
+| Challenge resolver | `ChallengeResolverOrigin` | `EnsureRoot` | Review board / probity authority / arbiter |
+
+Until eligibility is wired, `NotEligible` can never fire and eligibility policy
+is recorded but not enforced. Portals should not present eligibility as
+enforced until Module 15 lands.

@@ -1,0 +1,13 @@
+# Rust >= 1.82 makes `rust-lld` reject undefined symbols in wasm instead of
+# implicitly importing them from the `env` module. The host functions that
+# `sp-runtime-interface-proc-macro` declares (`ext_crypto_*`, `ext_storage_*`,
+# `ext_hashing_*`, ...) are emitted as plain `extern "C"` blocks with no
+# `#[link(wasm_import_module = "env")]`, so they fail to link on modern
+# toolchains. `--import-undefined` restores the old behaviour: unresolved
+# symbols become `env` imports, which is exactly what the Substrate executor
+# supplies at runtime.
+#
+# Remove this once the polkadot-sdk dependencies are upgraded to a release
+# whose runtime-interface macro emits explicit import modules.
+[env]
+WASM_BUILD_RUSTFLAGS = "-C link-arg=--import-undefined"

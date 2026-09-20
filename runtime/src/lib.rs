@@ -26,6 +26,7 @@ pub use pallet_timestamp::Call as TimestampCall;
 pub use sp_runtime::BuildStorage;
 
 pub mod genesis_config_presets;
+pub mod weights;
 
 /// Opaque types. These are used by the CLI to instantiate machinery that don't need to know
 /// the specifics of the runtime. They can then be made to be agnostic over specific formats
@@ -225,4 +226,8 @@ mod runtime {
 	// Include the custom logic from the pallet-template in the runtime.
 	#[runtime::pallet_index(7)]
 	pub type Template = pallet_template;
+
+	// Module 26 — TenderChain: public tender & procurement.
+	#[runtime::pallet_index(8)]
+	pub type TenderChain = pallet_tender_chain;
 }

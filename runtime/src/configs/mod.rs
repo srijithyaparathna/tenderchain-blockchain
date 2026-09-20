@@ -162,3 +162,66 @@ impl pallet_template::Config for Runtime {
 	type RuntimeEvent = RuntimeEvent;
 	type WeightInfo = pallet_template::weights::SubstrateWeight<Runtime>;
 }
+
+parameter_types! {
+	/// Bounds for Module 26 (TenderChain). Every collection in the pallet is
+	/// bounded — spec §8 forbids unbounded storage.
+	pub const TenderMaxWeights: u32 = 20;
+	pub const TenderMaxCredentials: u32 = 16;
+	pub const TenderMaxAddenda: u32 = 32;
+	pub const TenderMaxBidders: u32 = 128;
+	pub const TenderMaxEvaluators: u32 = 16;
+	pub const TenderMaxQuestions: u32 = 256;
+	pub const TenderMaxChallenges: u32 = 32;
+	pub const TenderMaxPriceLines: u32 = 64;
+	pub const TenderMaxDeadlinesPerBlock: u32 = 64;
+	pub const TenderMaxTransitionsPerBlock: u32 = 16;
+	/// Spec §5.2: ghost evaluation is defeated by attribution, which needs a
+	/// panel rather than a single scorer.
+	pub const TenderMinEvaluators: u32 = 3;
+	/// Blocks that must remain for bidders to reveal after the officer opens.
+	/// At 6s blocks this is ~10 minutes.
+	pub const TenderMinRevealWindow: BlockNumber = 100;
+	pub const TenderMaxScore: u8 = 100;
+	/// Spread between two evaluators on one criterion that auto-flags for
+	/// probity review (spec §5.2).
+	pub const TenderScoreVarianceThreshold: u8 = 30;
+}
+
+/// Configure Module 26 (TenderChain) in pallets/tender-chain.
+///
+/// NOTE FOR PRODUCTION DEPLOYMENT — spec §8 requires that the award authority be
+/// a *governed* origin (Multisig/governance), never a single key. `EnsureRoot`
+/// satisfies "not an ordinary signed officer" and is the correct stand-in until
+/// Module 16 (Multisig) lands, at which point both origins below should be
+/// repointed at the deployment's governance origin. The pallet cannot verify
+/// this property itself; it is the runtime's responsibility.
+impl pallet_tender_chain::Config for Runtime {
+	type RuntimeEvent = RuntimeEvent;
+	type Currency = Balances;
+	type TenderId = u32;
+	type PanelId = u32;
+	type AwardOrigin = frame_system::EnsureRoot<AccountId>;
+	type ChallengeResolverOrigin = frame_system::EnsureRoot<AccountId>;
+	// Modules 15 (Identity) / 10 (Reputation) and 25 (Work Task) are not in this
+	// runtime yet; the permissive no-op impls stand in. Wiring them later is a
+	// change to these two lines only.
+	type Eligibility = ();
+	type Delivery = ();
+	type MaxWeights = TenderMaxWeights;
+	type MaxCredentials = TenderMaxCredentials;
+	type MaxAddenda = TenderMaxAddenda;
+	type MaxBidders = TenderMaxBidders;
+	type MaxEvaluators = TenderMaxEvaluators;
+	type MaxQuestions = TenderMaxQuestions;
+	type MaxChallenges = TenderMaxChallenges;
+	type MaxPriceLines = TenderMaxPriceLines;
+	type MaxDeadlinesPerBlock = TenderMaxDeadlinesPerBlock;
+	type MaxTransitionsPerBlock = TenderMaxTransitionsPerBlock;
+	type MinRevealWindow = TenderMinRevealWindow;
+	type MinEvaluators = TenderMinEvaluators;
+	type MaxScore = TenderMaxScore;
+	type ScoreVarianceThreshold = TenderScoreVarianceThreshold;
+	// Real benchmarked weights, measured against this runtime's own bounds.
+	type WeightInfo = crate::weights::pallet_tender_chain::WeightInfo<Runtime>;
+}
