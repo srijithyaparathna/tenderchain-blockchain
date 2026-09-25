@@ -12,8 +12,8 @@ Pallet source: `pallets/tender-chain/`. Type definitions: `src/types.rs`.
 ## 1. Why this exists
 
 The pallet stores structure and proof, never readable content (spec §1.2, §8).
-A tender's title, its evaluation criteria, the text of a bidder question — each
-is on chain only as `Hash256`, a blake2-256 commitment:
+A tender's evaluation criteria, the text of a bidder question, an award
+rationale — each is on chain only as `Hash256`, a blake2-256 commitment:
 
 ```rust
 /// A 32-byte content commitment (blake2-256 of a DNC-anchored document, spec §1.2).
@@ -22,6 +22,10 @@ pub type Hash256 = [u8; 32];
 
 That is correct pallet design, but it leaves an open question the pallet
 deliberately does not answer: *where does the preimage live?*
+
+**Title, summary, challenge grounds and challenge resolutions are the
+exception.** They are held on chain in readable form — see §8. Everything else
+in the table below still needs the store this document specifies.
 
 The portal currently answers it with `localStorage`
 (`frontend/tenderchain/src/services/contentStore.ts`). That is adequate for a
@@ -95,7 +99,7 @@ value to compare against.
 
 | `content_type` | On-chain anchor | Shape |
 |---|---|---|
-| `notice` | `TenderRecord.notice_hash` | JSON — `{ title, summary, entity }` |
+| `notice` | `TenderRecord.notice_hash` | JSON — the full specification bundle |
 | `criteria` | `TenderRecord.criteria_hash` | JSON — array of criteria, `id` renumbered to index |
 | `addendum` | `AddendumRecord.content_hash` | text |
 | `question` | `QaRecord.question_hash` | text |
@@ -103,9 +107,13 @@ value to compare against.
 | `cancel_reason` | `Event::TenderCancelled.reason_hash` | text |
 | `conflict_declaration` | `EvaluatorRecord.conflict_declaration` (`Option`) | text |
 | `award_rationale` | `OutcomeRecord.rationale_hash` | text |
-| `challenge_grounds` | `ChallengeRecord.grounds_hash` | text |
-| `challenge_resolution` | `ChallengeRecord.resolution_hash` (`Option`) | text |
+| `challenge_evidence` | `ChallengeRecord.evidence_hash` (`Option`) | binary/text — supporting exhibits |
 | `contract` | `OutcomeRecord.contract_hash` (`Option`) | text |
+
+`challenge_grounds` and `challenge_resolution` were rows in this table and are
+not any more: both are readable on chain (§8). `challenge_evidence` replaces
+them for the case this store is still right for — exhibits too large to put in
+state.
 
 `criteria` is renumbered before hashing: the wizard labels criteria `c1`, `c2`…
 but `criterion_id` is a `u32` on chain, and scores are submitted against those
@@ -182,3 +190,64 @@ Build it when there is a query that the chain plus this table cannot answer
 efficiently: full-text search over notices, cross-tender analytics, or a tender
 list too large to enumerate client-side. Until then the chain is the index, and
 `content` is the dereference.
+
+---
+
+## 8. What is *not* in this store: readable public record
+
+`TenderRecord` carries the tender's name and short description on chain as
+readable `BoundedVec<u8, _>` fields, not hashes:
+
+```rust
+pub title: BoundedVec<u8, MaxTitleLen>,       // 128 bytes in the runtime
+pub summary: BoundedVec<u8, MaxSummaryLen>,   // 512 bytes in the runtime
+```
+
+The reasoning, in short: spec §1.2 confines hashing to *confidential* content,
+and a tender notice is published in order to be read. Hashing its name bought
+no confidentiality and cost real properties — an auditor reading raw chain
+state saw a bare commitment, and the readable text depended on whoever held the
+off-chain store. On chain, the subject matter of every procurement is permanent
+public record.
+
+`notice_hash` is unchanged and still anchors the full specification bundle:
+drawings, schedules and terms are far too large for chain storage. The split is
+deliberate — a short readable name on chain, the heavy document off it.
+
+Over-length input is **rejected, not truncated** (`TitleTooLong`,
+`SummaryTooLong`), and an empty title is rejected (`TitleEmpty`). A silently
+truncated title would be a wrong public record that the officer never saw
+happen.
+
+`Event::TenderCreated` carries `title`, so an indexer can build a tender list
+from the event stream alone without a state query per tender.
+
+### 8.1 Challenge grounds and resolutions
+
+`ChallengeRecord` follows the same rule, for the same reason:
+
+```rust
+pub grounds: BoundedVec<u8, MaxGroundsLen>,          // 2048 bytes in the runtime
+pub resolution: Option<BoundedVec<u8, MaxResolutionLen>>, // 2048 bytes, set on resolve
+pub evidence_hash: Option<Hash256>,                  // exhibits stay off chain
+```
+
+A challenge is an allegation that a public award was made improperly, and it
+suspends execution of that award in public while it stands. There was never
+confidentiality for hashing to protect, so the hash bought nothing and cost the
+property that matters: an auditor reading raw chain state could see *that* an
+award was challenged and upheld, but not what was alleged or why it was upheld.
+The readable text existed only in whichever browser held the preimage, which
+for the single record a procurement dispute turns on is the wrong place.
+
+`resolve_challenge`'s doc comment already claimed "either way the reasoning is
+permanent". Under the hash-only form that was not true. It is now.
+
+Both are **rejected, not truncated**, over length (`GroundsTooLong`,
+`ResolutionTooLong`), and neither may be empty (`GroundsEmpty`,
+`ResolutionEmpty`) — a ruling with no stated reasoning is not a ruling, and an
+allegation with no stated grounds suspends a lawful award on nothing.
+
+`evidence_hash` is `Option` and stays off chain: exhibits are drawings,
+correspondence and bid comparisons, far too large for state, exactly as
+`notice_hash` is for a tender.

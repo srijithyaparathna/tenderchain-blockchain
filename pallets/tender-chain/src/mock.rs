@@ -1,7 +1,10 @@
 use crate as pallet_tender_chain;
 use frame_support::{derive_impl, parameter_types};
 use frame_system::EnsureRoot;
-use pallet_tender_chain::types::{DeliveryInstantiator, Hash256};
+use pallet_tender_chain::types::{
+	DeliveryInstantiator, DocumentAnchor, Hash256, Notifier, ReputationFact, ReputationSink,
+	ReserveBonds, TenderId, TenderNotice,
+};
 use sp_runtime::BuildStorage;
 
 type Block = frame_system::mocking::MockBlock<Test>;
@@ -54,12 +57,17 @@ use frame_support::traits::ConstU64;
 parameter_types! {
 	pub const MaxWeights: u32 = 10;
 	pub const MaxCredentials: u32 = 8;
+	pub const MaxTitleLen: u32 = 128;
+	pub const MaxSummaryLen: u32 = 512;
+	pub const MaxGroundsLen: u32 = 2048;
+	pub const MaxResolutionLen: u32 = 2048;
 	pub const MaxAddenda: u32 = 8;
 	pub const MaxBidders: u32 = 16;
 	pub const MaxEvaluators: u32 = 8;
 	pub const MaxQuestions: u32 = 4;
 	pub const MaxChallenges: u32 = 3;
 	pub const MaxPriceLines: u32 = 16;
+	pub const MaxCallOffs: u32 = 2;
 	pub const MaxDeadlinesPerBlock: u32 = 32;
 	pub const MaxTransitionsPerBlock: u32 = 8;
 	pub const MinEvaluators: u32 = 2;
@@ -70,7 +78,7 @@ parameter_types! {
 
 parameter_types! {
 	/// Every award-to-delivery handoff the pallet requests, in order.
-	pub storage DeliveryLog: Vec<(u32, AccountId, Hash256)> = Vec::new();
+	pub storage DeliveryLog: Vec<(TenderId, AccountId, Hash256)> = Vec::new();
 }
 
 /// Stand-in for Module 25 (Work Task). Behaviourally identical to the `()`
@@ -79,9 +87,9 @@ parameter_types! {
 /// against a no-op that could never fail.
 pub struct RecordingDelivery;
 
-impl DeliveryInstantiator<AccountId, u32> for RecordingDelivery {
+impl DeliveryInstantiator<AccountId> for RecordingDelivery {
 	fn instantiate(
-		tender_id: u32,
+		tender_id: TenderId,
 		awardee: &AccountId,
 		contract_hash: Hash256,
 	) -> Result<Option<Hash256>, sp_runtime::DispatchError> {
@@ -94,25 +102,75 @@ impl DeliveryInstantiator<AccountId, u32> for RecordingDelivery {
 	}
 }
 
+parameter_types! {
+	/// Every notice sent, as (tender, notice, recipients).
+	pub storage NoticeLog: Vec<(TenderId, TenderNotice, Vec<AccountId>)> = Vec::new();
+	/// Every reputation fact reported, as (tender, account, fact).
+	pub storage ReputationLog: Vec<(TenderId, AccountId, ReputationFact)> = Vec::new();
+}
+
+/// Stand-in for Module 13: records instead of mailing.
+pub struct RecordingNotifier;
+
+impl Notifier<AccountId> for RecordingNotifier {
+	fn notify(tender_id: TenderId, notice: TenderNotice, recipients: &[AccountId]) {
+		let mut log = NoticeLog::get();
+		log.push((tender_id, notice, recipients.to_vec()));
+		NoticeLog::set(&log);
+	}
+}
+
+/// Stand-in for Module 10: records instead of scoring.
+pub struct RecordingReputation;
+
+impl ReputationSink<AccountId> for RecordingReputation {
+	fn record(tender_id: TenderId, who: &AccountId, fact: ReputationFact) {
+		let mut log = ReputationLog::get();
+		log.push((tender_id, *who, fact));
+		ReputationLog::set(&log);
+	}
+}
+
+/// A hash DNC does not hold. Everything else counts as anchored.
+pub const UNANCHORED: Hash256 = [0xBAu8; 32];
+
+/// Stand-in for Module 2: rejects exactly `UNANCHORED`, so tests can prove the
+/// anchoring check is wired without changing any other hash.
+pub struct MockDnc;
+
+impl DocumentAnchor for MockDnc {
+	fn is_anchored(hash: &Hash256) -> bool {
+		hash != &UNANCHORED
+	}
+}
+
 impl pallet_tender_chain::Config for Test {
 	type RuntimeEvent = RuntimeEvent;
 	type Currency = Balances;
-	type TenderId = u32;
-	type PanelId = u32;
+	type Bonds = ReserveBonds<Balances>;
 	// Spec §8 demands a governed origin; root stands in for a Multisig here.
 	type AwardOrigin = EnsureRoot<AccountId>;
 	type ChallengeResolverOrigin = EnsureRoot<AccountId>;
+	type PolicyOrigin = EnsureRoot<AccountId>;
 	// Permissive stubs — Modules 15/10 and 25 do not exist yet.
 	type Eligibility = ();
 	type Delivery = RecordingDelivery;
+	type Notices = RecordingNotifier;
+	type Documents = MockDnc;
+	type Reputation = RecordingReputation;
 	type MaxWeights = MaxWeights;
 	type MaxCredentials = MaxCredentials;
+	type MaxTitleLen = MaxTitleLen;
+	type MaxSummaryLen = MaxSummaryLen;
+	type MaxGroundsLen = MaxGroundsLen;
+	type MaxResolutionLen = MaxResolutionLen;
 	type MaxAddenda = MaxAddenda;
 	type MaxBidders = MaxBidders;
 	type MaxEvaluators = MaxEvaluators;
 	type MaxQuestions = MaxQuestions;
 	type MaxChallenges = MaxChallenges;
 	type MaxPriceLines = MaxPriceLines;
+	type MaxCallOffs = MaxCallOffs;
 	type MaxDeadlinesPerBlock = MaxDeadlinesPerBlock;
 	type MaxTransitionsPerBlock = MaxTransitionsPerBlock;
 	type MinRevealWindow = MinRevealWindow;

@@ -44,7 +44,9 @@ closed the tender. Scan block events too.
 
 ## 2. Event schema
 
-Field types: `tender_id` is `u32`; `panel_id` is `u32`; `Hash256` is a 32-byte
+Field types: every id — `tender_id`, `question_id`, `challenge_id`, `panel_id`,
+`call_off_id`, `criterion_id` and a price line's `item_id` — is a 32-byte hash (`[u8; 32]`,
+rendered as 0x-hex), never a counter; see §2a. `Hash256` is a 32-byte
 blake2-256 content commitment (hex, DNC-resolvable); `block` is `BlockNumber`;
 `amount` is `Balance`.
 
@@ -52,7 +54,7 @@ blake2-256 content commitment (hex, DNC-resolvable); `block` is `BlockNumber`;
 
 | Event | Fields | Meaning for the record |
 |---|---|---|
-| `TenderCreated` | `tender_id`, `officer` | Draft exists. Nothing is locked yet. |
+| `TenderCreated` | `tender_id`, `officer`, `title` | Draft exists. Nothing is locked yet. `title` is readable UTF-8, so an indexer can list tenders from events alone. |
 | `TenderPublished` | `tender_id`, `entity`, `close_block` | **The lock point.** From this block criteria hash, weights, gates and eligibility are immutable. `close_block` is the consensus submission deadline. |
 | `AddendumPublished` | `tender_id`, `content_hash`, `extended_close_to` | A clarification or change. `extended_close_to` is `Some` only when the close moved — and it can only ever move later. |
 | `QuestionAsked` | `tender_id`, `question_id` | Omits the asker. Whether authorship is resolvable at all depends on the tender's `blind_questions` policy — see §3a. |
@@ -93,15 +95,65 @@ blake2-256 content commitment (hex, DNC-resolvable); `block` is `BlockNumber`;
 | `DeliveryInstantiated` | `tender_id`, `awardee`, `delivery_project` | One per awardee. `delivery_project` is the Module 25 reference (spec §4.2 names it on the execution event; it is split out here because a panel award has several awardees). `None` while Work Task is stubbed. |
 | `ShortlistPublished` | `tender_id`, `suppliers` | An EOI closed stage one. Those suppliers can now bid on an RFT created with `shortlist_from` pointing at this tender. |
 | `PanelMemberAdmitted` | `panel_id`, `supplier` | Panel/standing-offer award admitted a supplier to the pool. |
-| `CallOffPlaced` | `panel_id`, `supplier`, `order_hash` | An order against a standing offer. |
+| `CallOffPlaced` | `panel_id`, `call_off_id`, `supplier`, `order_hash` | An order against a standing offer, stored in `CallOffs`. |
+| `CriteriaAmended` | `tender_id`, `criteria_hash` | A draft's criteria were replaced. Impossible after publication (`CriteriaLocked`). |
+| `PolicyUpdated` | `policy` | The deployment's procurement policy changed. Binds tenders published from now on only. |
 | `BondReturned` / `BondForfeited` | `tender_id`, `bidder`, `amount` | Bond settlement. Returns happen automatically on execute and on cancellation. |
 | `TenderCancelled` | `tender_id`, `reason_hash` | Terminal, and the reason is permanently public — silent cancellation is not possible. |
+| `GateDropped` | `tender_id`, `gate` | A deadline overflowed its block and every block in the 16-block look-ahead was also full. Should never occur with sane `MaxDeadlinesPerBlock`; if it does, the tender is stuck at that gate and needs probity attention. |
+
+## 2a. Hashed identifiers
+
+No id in this pallet is a counter. A counter leaks volume (how many tenders an
+entity has run, how many questions or challenges a tender drew) and invites
+reuse across forks and restarts. Chain-minted ids are domain-separated
+blake2-256 hashes, and each has a public helper so a portal or auditor can
+recompute it:
+
+| Id | Preimage | Helper |
+|---|---|---|
+| `tender_id` | `"tenderchain/tender" ‖ SCALE(officer) ‖ SCALE(entity) ‖ SCALE(nonce: u64) ‖ SCALE(created_at)` | `Pallet::tender_id_for` |
+| `question_id` | `"tenderchain/question" ‖ tender_id ‖ SCALE(index: u32)` | `Pallet::question_id_for` |
+| `challenge_id` | `"tenderchain/challenge" ‖ tender_id ‖ SCALE(index: u32)` | `Pallet::challenge_id_for` |
+| `panel_id` | `"tenderchain/panel" ‖ tender_id` | `Pallet::panel_id_of` |
+| `call_off_id` | `"tenderchain/calloff" ‖ panel_id ‖ SCALE(index: u32)` | `Pallet::call_off_id_for` |
+
+`nonce` is the `TenderNonce` storage value at creation; `index` is the number of
+questions (`QuestionCount`), challenges (`ChallengeCount`) or call-offs
+(`CallOffCount`) the tender or panel already held.
+
+Every id, where it is stored, and who mints it:
+
+| Name | Type alias | Stored in | Minted by |
+|---|---|---|---|
+| Tender id | `TenderId` | `Tenders` and every per-tender map | chain, `create_tender` |
+| Question id | `QuestionId` | `Questions` | chain, `ask_question` |
+| Challenge id | `ChallengeId` | `Challenges` | chain, `lodge_challenge` |
+| Panel id | `PanelId` | `PanelPool`, `PanelTender`, `CallOffs` | chain, derived from the tender |
+| Call-off id | `CallOffId` | `CallOffs` | chain, `call_off` |
+| Criterion id | `CriterionId` | `TenderRecord.weights`, `ScoreSheet.scores` | caller, hash of the criterion's definition |
+| Price-line item id | `ItemId` | `RevealRecord.price_schedule` | caller, hash of the line's definition | `created_at` is also stored on the tender record, and is what lists
+should sort by, since hashes carry no order.
+
+The asker is deliberately **not** part of a question's preimage: with blinded
+authorship, a hash over the asker could be brute-forced against the handful of
+plausible suppliers and would undo the blinding.
+
+`criterion_id` and `item_id` are supplied by the caller as hashes of their own
+definitions. The portal uses
+`blake2_256(JSON{index, name, description, weight})` for a criterion (so the id
+points at one entry in the document `criteria_hash` commits to) and
+`blake2_256("item:" ‖ index ‖ ":" ‖ description)` for a price line. Criterion
+ids must be unique within a tender and within a scoresheet
+(`DuplicateCriterion`).
 
 ### Panel id derivation
 
-A panel is established by the tender that awarded it: `panel_id == tender_id` of
-the establishing `Panel` tender. `PanelMemberAdmitted` therefore correlates with
-that tender's `Awarded` events in the same block.
+A panel is established by the tender that awarded it: `panel_id ==
+panel_id_of(tender_id)` of the establishing `Panel` tender, and `PanelTender`
+maps it back. Members are admitted by `execute_award`, not `award`, so an award
+overturned during standstill never reaches the pool; `PanelMemberAdmitted`
+correlates with that tender's `ContractExecuted` in the same block.
 
 ## 3a. Question authorship and blinding
 
@@ -148,7 +200,7 @@ commitment = blake2_256( SCALE(bidder_account_id)
                        ‖ salt )                    (32 bytes)
 ```
 
-`PriceLine` is `{ item_id: u32, amount: Balance }`. The price schedule must be
+`PriceLine` is `{ item_id: [u8; 32], amount: Balance }`. The price schedule must be
 SCALE-encoded **as the `BoundedVec` it becomes on chain**, in the same order
 that will later be passed to `reveal_bid`. Reordering the lines changes the
 hash and voids the bid. `Pallet::compute_commitment` is the canonical
@@ -180,7 +232,10 @@ interchangeable — the wrong one returns `WrongBidMode`.
    opening window, with byte-identical inputs.
 
 A reveal outside the window fails with `RevealWindowClosed`; the bid is then
-treated as a non-reveal and the bond is forfeited if the terms say so. Front
+treated as a non-reveal and the bond is forfeited if the terms say so. A
+**mismatched** reveal is treated the same way at the end of the window (spec
+§8): otherwise a bidder who saw rivals' prices could escape the forfeit by
+revealing garbage instead of nothing. Front
 ends should surface the opening window as a hard countdown, not a soft reminder.
 
 **A mismatching reveal succeeds as a transaction.** `reveal_bid` does not error
@@ -195,6 +250,7 @@ that carries the meaning.)
 
 | Error | Front-end handling |
 |---|---|
+| `BondRequired` | The bidder cannot cover the bid bond. Show the bond amount and the free balance. |
 | `SubmissionClosed` | The block gate closed the tender. Not recoverable — do not offer a retry. |
 | `NotEligible` | The bidder lacks a required credential or the reputation floor. Link to Module 15 credential remediation. |
 | `CommitmentExists` | One commitment per bidder per tender; offer `withdraw_commitment` instead. |
@@ -224,8 +280,10 @@ system.
 - Gates must satisfy
   `publish_at < questions_close_at < submission_close_at <= opening_at < opening_end_at`,
   else `GateOrderInvalid`.
-- `publish_tender` must be called while `now < questions_close_at` — a draft
-  that misses its own Q&A window can never be published.
+- `publish_tender` must be called while `publish_at <= now < questions_close_at`
+  — publication is a block gate (`PublishTooEarly` before it), and a draft that
+  misses its own Q&A window can never be published.
+- Criterion ids must be distinct (`DuplicateCriterion`).
 - `BidMode::Open` is only valid for `TenderKind::Rfq` (`OpenBidNotPermitted`).
 
 ### Things the API deliberately does not allow
@@ -234,6 +292,45 @@ There is no extrinsic to amend criteria, weights or eligibility after
 publication, and none to shorten a submission window. These are absent from the
 API rather than blocked by a permission check, so a portal cannot expose them
 and should not imply they exist. An addendum may extend the close block only.
+
+### Things only the entity may do
+
+`cancel_tender` is the procuring entity's call (spec §4.1: "entity authority
+(governed)"), not the officer's (`NotEntity`). The entity account should be the
+entity's governed (multisig) identity. The portal creates tenders with the
+officer as entity, so for those the two coincide.
+
+### Draft criteria can be amended; published criteria cannot
+
+`amend_criteria(tender_id, criteria_hash, weights)` replaces a draft's criteria,
+validated exactly as at creation. After `publish_tender` it fails with
+`CriteriaLocked` — criteria are locked before a single bid arrives (spec §1.1).
+
+### Jurisdictional policy (spec §8)
+
+`set_policy` (governed `PolicyOrigin`) sets the deployment's
+`ProcurementPolicy`. The default is fully permissive.
+
+| Field | Rule | Error |
+|---|---|---|
+| `min_standstill` | A tender's `standstill_period` must be at least this | `StandstillTooShort` |
+| `min_submission_period` | Blocks from publication to submission close — checked at creation against `publish_at`, and again at publication against the actual block, so a late publish cannot squeeze the market | `SubmissionPeriodTooShort` |
+| `addendum_response_window` | After any addendum, bidders must have at least this many blocks before close; a late addendum must extend the close to restore it | `AddendumNeedsExtension` |
+| `max_close_extension` | Addenda may push the close at most this far past the **published** close (so it cannot be ratcheted); `None` means no cap | `CloseExtensionTooLong` |
+
+Each tender snapshots the policy at publication (`TenderRecord.policy`, with the
+original close in `published_close_at`). Changing the policy never moves the
+rules of a tender that is already live.
+
+An extension shifts `opening_at` and `opening_end_at` by the same amount as the
+close, so any gap published between close and opening, and the reveal window's
+length, are preserved.
+
+### Answers are final
+
+`answer_question` is accepted during `QaWindow` and `Submission` only, and a
+question can be answered once (`AlreadyAnswered`). Correct a published answer
+with an addendum so the correction is itself on the record.
 
 ### Panel call-offs
 
@@ -284,11 +381,23 @@ Everything below is answerable from public data with no privileged access.
 ## 5a. Challenge standing and bounds
 
 `lodge_challenge` is restricted to accounts that lodged a commitment on that
-tender (`NotAParticipant` otherwise). This matters because every open challenge
+tender (`NotAParticipant` otherwise) and did not win it
+(`AwardeeCannotChallenge`), and only while the award stands — the tender must
+be `Awarded` or `Challenged`. A cancelled tender, or one already remitted to
+re-evaluation, cannot be challenged, and ruling on a challenge never moves a
+cancelled tender out of `Cancelled`. This matters because every open challenge
 suspends `execute_award`: without the restriction any account could hold a
 lawful award hostage indefinitely. Challenges are additionally capped at
 `MaxChallenges` per tender, so the suspension window is bounded even from a
 bidder with standing.
+
+Both sides of a challenge are readable on chain, not hashed: `lodge_challenge`
+takes `grounds: Vec<u8>` plus an optional `evidence_hash` for exhibits, and
+`resolve_challenge` takes `resolution: Vec<u8>`. Neither may be empty, and
+over-length input is rejected rather than truncated (`GroundsTooLong`,
+`GroundsEmpty`, `ResolutionTooLong`, `ResolutionEmpty`). A portal therefore
+renders a challenge log in full from chain state alone, with no content-store
+lookup — see `offchain-content-store.md` §8.1 for why.
 
 Questions are capped at `MaxQuestions` and evaluators at `MaxEvaluators` per
 tender. Re-appointing an evaluator already on the panel refreshes their record
@@ -296,20 +405,31 @@ rather than consuming a slot — and, because re-appointment clears the conflict
 declaration and deactivates them, it also decrements the activated tally that
 `MinEvaluators` is checked against.
 
-## 6. Integration seams not yet wired
+## 6. Integration seams (spec §7)
 
 The pallet is complete and self-contained, but Modules 2/8/10/13/15/16/19/25 do
-not exist in this runtime yet. Two trait seams carry permissive no-op `()`
-implementations, and swapping them is a change to the runtime `Config` impl
-only — no pallet logic changes:
+not exist in this runtime yet. Every point where the spec's integration map
+touches TenderChain is a `Config` seam with a stand-in, so wiring a real module
+is a change to the runtime `Config` impl only — no pallet logic, storage or
+events change:
 
-| Seam | Trait | Currently | Should become |
-|---|---|---|---|
-| Bidder eligibility | `EligibilityProvider` | `()` — everyone eligible | Module 15 (Identity) credentials + Module 10 (Reputation) score |
-| Award-to-delivery | `DeliveryInstantiator` | `()` — award recorded, no delivery project | Module 25 (Work Task) instantiation |
-| Bid bonds | `ReservableCurrency` | Balances reserve/unreserve | Module 8 (Escrow) |
-| Award authority | `AwardOrigin` | `EnsureRoot` | Module 16 (Multisig) / governance |
-| Challenge resolver | `ChallengeResolverOrigin` | `EnsureRoot` | Review board / probity authority / arbiter |
+| Module | Config item | Trait | Currently | Should become |
+|---|---|---|---|---|
+| 8 Escrow | `Bonds` | `BondManager` (`lock` / `release` / `forfeit`) | `ReserveBonds<Balances>` — reserved on the bidder's own account, forfeits repatriated to the entity | Escrow lock / return / forfeit |
+| 15 Identity + 10 Reputation | `Eligibility` | `EligibilityProvider` | `()` — everyone eligible | Credentials + reputation floor |
+| 10 Reputation | `Reputation` | `ReputationSink` | `()` — facts dropped | Records `ContractWon`, `BondForfeited` (supplier) and `ContractAwarded`, `TenderCancelled` (entity) |
+| 25 Work Task | `Delivery` | `DeliveryInstantiator` | `()` — no delivery project | Module 25 instantiation |
+| 13 Email | `Notices` | `Notifier` | `()` — events only | System mail: public notice on publish; every participant on addendum, award, standstill closed, challenge lodged/resolved, contract executed, cancellation |
+| 2 DNC | `Documents` | `DocumentAnchor` | `()` — every hash accepted | Rejects (`DocumentNotAnchored`) a notice, criteria, addendum, rationale, contract, cancellation reason or challenge evidence hash DNC does not hold |
+| 16 Multisig | `AwardOrigin` | `EnsureOrigin` | `EnsureRoot` | Multisig / governance origin |
+| Review board | `ChallengeResolverOrigin` | `EnsureOrigin` | `EnsureRoot` | Probity authority / arbiter |
+| 19 Sentinel | — | — | — | Consumes this pallet's events; no seam needed |
+| 12 FastLane | — | `EligibilityProvider` | — | Pre-consensus filter using the same check the pallet re-runs on chain |
+
+`Notifier` and `ReputationSink` are infallible on purpose: a mail or reputation
+outage must never block a tender's lifecycle, and the pallet's events remain the
+authoritative record. When a real implementation is wired, its cost must be
+added to the benchmarks of the calls that invoke it.
 
 Until eligibility is wired, `NotEligible` can never fire and eligibility policy
 is recorded but not enforced. Portals should not present eligibility as

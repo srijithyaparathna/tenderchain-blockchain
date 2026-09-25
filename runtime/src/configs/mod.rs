@@ -168,12 +168,21 @@ parameter_types! {
 	/// bounded — spec §8 forbids unbounded storage.
 	pub const TenderMaxWeights: u32 = 20;
 	pub const TenderMaxCredentials: u32 = 16;
+	pub const TenderMaxTitleLen: u32 = 128;
+	pub const TenderMaxSummaryLen: u32 = 512;
+	/// Challenge grounds and rulings are legal reasoning, not labels, so they get
+	/// materially more room than a title. 2 KiB each, 32 challenges per tender,
+	/// bounds a tender's challenge log at 128 KiB of state.
+	pub const TenderMaxGroundsLen: u32 = 2048;
+	pub const TenderMaxResolutionLen: u32 = 2048;
 	pub const TenderMaxAddenda: u32 = 32;
 	pub const TenderMaxBidders: u32 = 128;
 	pub const TenderMaxEvaluators: u32 = 16;
 	pub const TenderMaxQuestions: u32 = 256;
 	pub const TenderMaxChallenges: u32 = 32;
 	pub const TenderMaxPriceLines: u32 = 64;
+	/// Call-off orders a standing-offer panel can hold.
+	pub const TenderMaxCallOffs: u32 = 256;
 	pub const TenderMaxDeadlinesPerBlock: u32 = 64;
 	pub const TenderMaxTransitionsPerBlock: u32 = 16;
 	/// Spec §5.2: ghost evaluation is defeated by attribution, which needs a
@@ -199,23 +208,38 @@ parameter_types! {
 impl pallet_tender_chain::Config for Runtime {
 	type RuntimeEvent = RuntimeEvent;
 	type Currency = Balances;
-	type TenderId = u32;
-	type PanelId = u32;
+	// Module 8 (Escrow) is not in this runtime yet: bonds are reserved on the
+	// bidder's own account until it is.
+	type Bonds = pallet_tender_chain::ReserveBonds<Balances>;
 	type AwardOrigin = frame_system::EnsureRoot<AccountId>;
 	type ChallengeResolverOrigin = frame_system::EnsureRoot<AccountId>;
+	// Jurisdictional procurement policy (spec §8) is set per deployment by the
+	// same governed authority. Until one is set, the policy is permissive.
+	type PolicyOrigin = frame_system::EnsureRoot<AccountId>;
 	// Modules 15 (Identity) / 10 (Reputation) and 25 (Work Task) are not in this
 	// runtime yet; the permissive no-op impls stand in. Wiring them later is a
 	// change to these two lines only.
 	type Eligibility = ();
 	type Delivery = ();
+	// Modules 13 (Email), 2 (DNC) and 10 (Reputation) likewise: events stand in
+	// for mail, every document hash is accepted, and reputation facts are
+	// dropped. Each becomes a one-line change when its module lands.
+	type Notices = ();
+	type Documents = ();
+	type Reputation = ();
 	type MaxWeights = TenderMaxWeights;
 	type MaxCredentials = TenderMaxCredentials;
+	type MaxTitleLen = TenderMaxTitleLen;
+	type MaxSummaryLen = TenderMaxSummaryLen;
+	type MaxGroundsLen = TenderMaxGroundsLen;
+	type MaxResolutionLen = TenderMaxResolutionLen;
 	type MaxAddenda = TenderMaxAddenda;
 	type MaxBidders = TenderMaxBidders;
 	type MaxEvaluators = TenderMaxEvaluators;
 	type MaxQuestions = TenderMaxQuestions;
 	type MaxChallenges = TenderMaxChallenges;
 	type MaxPriceLines = TenderMaxPriceLines;
+	type MaxCallOffs = TenderMaxCallOffs;
 	type MaxDeadlinesPerBlock = TenderMaxDeadlinesPerBlock;
 	type MaxTransitionsPerBlock = TenderMaxTransitionsPerBlock;
 	type MinRevealWindow = TenderMinRevealWindow;

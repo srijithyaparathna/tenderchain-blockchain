@@ -379,6 +379,11 @@ impl<T: frame_system::Config> pallet_tender_chain::WeightInfo for WeightInfo<T> 
 		Weight::from_parts(30_280_000, 0)
 			.saturating_add(Weight::from_parts(0, 4282))
 			.saturating_add(T::DbWeight::get().reads(3))
+			// PROVISIONAL, hand-added: call-offs are now stored (CallOffCount,
+			// CallOffs). Overwritten by the next benchmark run.
+			.saturating_add(Weight::from_parts(10_000_000, 3_000))
+			.saturating_add(T::DbWeight::get().reads(2))
+			.saturating_add(T::DbWeight::get().writes(2))
 	}
 	/// Storage: `TenderChain::Tenders` (r:1 w:1)
 	/// Proof: `TenderChain::Tenders` (`max_values`: None, `max_size`: Some(817), added: 3292, mode: `MaxEncodedLen`)
@@ -448,5 +453,21 @@ impl<T: frame_system::Config> pallet_tender_chain::WeightInfo for WeightInfo<T> 
 			.saturating_add(T::DbWeight::get().writes(1))
 			.saturating_add(T::DbWeight::get().writes((1_u64).saturating_mul(n.into())))
 			.saturating_add(Weight::from_parts(0, 3292).saturating_mul(n.into()))
+	}
+	/// PROVISIONAL, hand-added — not measured. Modelled on `create_tender`'s
+	/// per-criterion cost with one `Tenders` read and write. Overwritten by the
+	/// next benchmark run.
+	fn amend_criteria(w: u32, ) -> Weight {
+		Weight::from_parts(40_000_000, 0)
+			.saturating_add(Weight::from_parts(0, 4282))
+			.saturating_add(Weight::from_parts(200_000, 0).saturating_mul(w.into()))
+			.saturating_add(T::DbWeight::get().reads(1))
+			.saturating_add(T::DbWeight::get().writes(1))
+	}
+	/// PROVISIONAL, hand-added — not measured. One `Policy` write. Overwritten
+	/// by the next benchmark run.
+	fn set_policy() -> Weight {
+		Weight::from_parts(15_000_000, 0)
+			.saturating_add(T::DbWeight::get().writes(1))
 	}
 }

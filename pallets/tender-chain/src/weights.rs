@@ -62,6 +62,9 @@ pub trait WeightInfo {
 	fn submit_open_bid(p: u32) -> Weight;
 	/// `n`: gate transitions processed this block.
 	fn on_initialize(n: u32) -> Weight;
+	/// `w`: number of weighted criteria.
+	fn amend_criteria(w: u32) -> Weight;
+	fn set_policy() -> Weight;
 }
 
 /// Test/mock implementation. Not metered — never use in production.
@@ -178,7 +181,18 @@ impl WeightInfo for () {
 	}
 	fn call_off() -> Weight {
 		Weight::from_parts(15_000_000, 3_000)
+			.saturating_add(RocksDbWeight::get().reads(5_u64))
+			.saturating_add(RocksDbWeight::get().writes(2_u64))
+	}
+	fn amend_criteria(w: u32) -> Weight {
+		Weight::from_parts(15_000_000, 4_000)
+			.saturating_add(Weight::from_parts(100_000, 0).saturating_mul(w as u64))
 			.saturating_add(RocksDbWeight::get().reads(1_u64))
+			.saturating_add(RocksDbWeight::get().writes(1_u64))
+	}
+	fn set_policy() -> Weight {
+		Weight::from_parts(8_000_000, 0)
+			.saturating_add(RocksDbWeight::get().writes(1_u64))
 	}
 	fn on_initialize(n: u32) -> Weight {
 		Weight::from_parts(10_000_000, 3_000)

@@ -59,24 +59,41 @@ fn funded_account<T: Config>(name: &'static str, index: u32) -> T::AccountId {
 	who
 }
 
+/// A distinct 32-byte id per index, standing in for the hash of a criterion
+/// or price-line definition.
+fn hashed(i: u32) -> Hash256 {
+	sp_io::hashing::blake2_256(&i.to_le_bytes())
+}
+
 /// `w` criteria whose weights sum to exactly 100, as `create_tender` demands.
 fn criteria(w: u32) -> Vec<CriterionWeight> {
 	let rest = w.saturating_sub(1);
 	let head = 100u32.saturating_sub(rest);
-	let mut v = vec![CriterionWeight { criterion_id: 0, weight_percent: head as u8 }];
+	let mut v = vec![CriterionWeight { criterion_id: hashed(0), weight_percent: head as u8 }];
 	for i in 1..w {
-		v.push(CriterionWeight { criterion_id: i, weight_percent: 1 });
+		v.push(CriterionWeight { criterion_id: hashed(i), weight_percent: 1 });
 	}
 	v
 }
 
+/// The id `create_tender` is about to mint for `officer` (who is also the
+/// entity throughout these benchmarks).
+fn next_tender_id<T: Config>(officer: &T::AccountId) -> TenderId {
+	TenderChain::<T>::tender_id_for(
+		officer,
+		officer,
+		TenderNonce::<T>::get(),
+		frame_system::Pallet::<T>::block_number(),
+	)
+}
+
 /// Gate schedule shared by every benchmark:
-/// publish 2 → questions close 10 → submissions close 20 → opening 20 →
+/// publish 1 → questions close 10 → submissions close 20 → opening 20 →
 /// opening ends 30, with a 10-block standstill after award.
 fn gates<T: Config>() -> TenderGates<BlockNumberFor<T>> {
 	let open_at: BlockNumberFor<T> = SUBMISSION_CLOSE.into();
 	TenderGates {
-		publish_at: 2u32.into(),
+		publish_at: 1u32.into(),
 		questions_close_at: QUESTIONS_CLOSE.into(),
 		submission_close_at: open_at,
 		opening_at: open_at,
@@ -125,13 +142,15 @@ fn create<T: Config>(
 	officer: &T::AccountId,
 	kind: TenderKind,
 	w: u32,
-) -> Result<T::TenderId, BenchmarkError> {
-	let raw = NextTenderId::<T>::get();
+) -> Result<TenderId, BenchmarkError> {
+	let id = next_tender_id::<T>(officer);
 	TenderChain::<T>::create_tender(
 		RawOrigin::Signed(officer.clone()).into(),
 		officer.clone(),
 		kind,
 		BidMode::Sealed,
+		vec![b'x'; T::MaxTitleLen::get() as usize],
+		vec![b'x'; T::MaxSummaryLen::get() as usize],
 		[1u8; 32],
 		[2u8; 32],
 		criteria(w),
@@ -147,14 +166,14 @@ fn create<T: Config>(
 		false,
 		None,
 	)?;
-	Ok(raw.into())
+	Ok(id)
 }
 
 fn create_and_publish<T: Config>(
 	officer: &T::AccountId,
 	kind: TenderKind,
 	w: u32,
-) -> Result<T::TenderId, BenchmarkError> {
+) -> Result<TenderId, BenchmarkError> {
 	let id = create::<T>(officer, kind, w)?;
 	TenderChain::<T>::publish_tender(RawOrigin::Signed(officer.clone()).into(), id)?;
 	Ok(id)
@@ -162,7 +181,7 @@ fn create_and_publish<T: Config>(
 
 fn price_lines<T: Config>(p: u32) -> Vec<PriceLine<BalanceOf<T>>> {
 	(0..p)
-		.map(|i| PriceLine { item_id: i, amount: unit::<T>().saturating_mul((i + 1).into()) })
+		.map(|i| PriceLine { item_id: hashed(i), amount: unit::<T>().saturating_mul((i + 1).into()) })
 		.collect()
 }
 
@@ -174,7 +193,7 @@ fn bounded_prices<T: Config>(
 
 /// Commit a bid that will reveal validly.
 fn commit<T: Config>(
-	tender_id: T::TenderId,
+	tender_id: TenderId,
 	bidder: &T::AccountId,
 	p: u32,
 ) -> Result<(), BenchmarkError> {
@@ -185,7 +204,7 @@ fn commit<T: Config>(
 }
 
 fn reveal<T: Config>(
-	tender_id: T::TenderId,
+	tender_id: TenderId,
 	bidder: &T::AccountId,
 	p: u32,
 ) -> Result<(), BenchmarkError> {
@@ -210,7 +229,7 @@ fn panel_size<T: Config>() -> u32 {
 }
 
 fn appoint_and_activate<T: Config>(
-	tender_id: T::TenderId,
+	tender_id: TenderId,
 	officer: &T::AccountId,
 	evaluator: &T::AccountId,
 ) -> Result<(), BenchmarkError> {
@@ -234,7 +253,7 @@ fn appoint_and_activate<T: Config>(
 }
 
 fn scoresheet(w: u32) -> Vec<CriterionScore> {
-	(0..w).map(|i| CriterionScore { criterion_id: i, score: 50 }).collect()
+	(0..w).map(|i| CriterionScore { criterion_id: hashed(i), score: 50 }).collect()
 }
 
 /// Drive a tender all the way to `Evaluation` with `b` bidders holding valid
@@ -244,7 +263,7 @@ fn scoresheet(w: u32) -> Vec<CriterionScore> {
 /// scoresheets — `submit_scores` leaves one unscored so the measured call is a
 /// genuine first-time insert that still walks the variance-comparison loop.
 struct Setup<T: Config> {
-	tender_id: T::TenderId,
+	tender_id: TenderId,
 	bidders: Vec<T::AccountId>,
 	evaluators: Vec<T::AccountId>,
 }
@@ -292,15 +311,23 @@ fn setup_to_evaluation<T: Config>(
 	Ok(Setup { tender_id, bidders, evaluators })
 }
 
-/// Award the tender to its first bidder and return the outcome's standstill end.
+/// Award the tender to `awardees`.
 fn do_award<T: Config>(
-	tender_id: T::TenderId,
-	awardee: &T::AccountId,
+	tender_id: TenderId,
+	awardees: Vec<T::AccountId>,
 ) -> Result<(), BenchmarkError> {
 	let origin = T::AwardOrigin::try_successful_origin()
 		.map_err(|_| BenchmarkError::Stop("no successful AwardOrigin"))?;
-	TenderChain::<T>::award(origin, tender_id, vec![awardee.clone()], [6u8; 32])?;
+	TenderChain::<T>::award(origin, tender_id, awardees, [6u8; 32])?;
 	Ok(())
+}
+
+/// Run past the standstill of an award made at `opening_end`.
+fn past_standstill<T: Config>() {
+	let after = opening_end::<T>()
+		.saturating_add(STANDSTILL.into())
+		.saturating_add(One::one());
+	advance_to_bn::<T>(after);
 }
 
 #[benchmarks]
@@ -312,7 +339,7 @@ mod benchmarks {
 		start::<T>();
 		let officer: T::AccountId = whitelisted_caller();
 		fund::<T>(&officer);
-		let raw = NextTenderId::<T>::get();
+		let id = next_tender_id::<T>(&officer);
 
 		#[extrinsic_call]
 		_(
@@ -320,6 +347,8 @@ mod benchmarks {
 			officer.clone(),
 			TenderKind::Rft,
 			BidMode::Sealed,
+			vec![b'x'; T::MaxTitleLen::get() as usize],
+			vec![b'x'; T::MaxSummaryLen::get() as usize],
 			[1u8; 32],
 			[2u8; 32],
 			criteria(w),
@@ -336,7 +365,6 @@ mod benchmarks {
 			None,
 		);
 
-		let id: T::TenderId = raw.into();
 		assert!(Tenders::<T>::get(id).is_some());
 		Ok(())
 	}
@@ -367,7 +395,7 @@ mod benchmarks {
 		#[extrinsic_call]
 		_(RawOrigin::Signed(bidder), id, [11u8; 32], [12u8; 32]);
 
-		assert!(Questions::<T>::contains_key(id, 0));
+		assert!(Questions::<T>::contains_key(id, TenderChain::<T>::question_id_for(&id, 0)));
 		Ok(())
 	}
 
@@ -385,10 +413,12 @@ mod benchmarks {
 			[12u8; 32],
 		)?;
 
-		#[extrinsic_call]
-		_(RawOrigin::Signed(officer), id, 0u32, [12u8; 32]);
+		let qid = TenderChain::<T>::question_id_for(&id, 0);
 
-		let q = Questions::<T>::get(id, 0u32).expect("asked; qed");
+		#[extrinsic_call]
+		_(RawOrigin::Signed(officer), id, qid, [12u8; 32]);
+
+		let q = Questions::<T>::get(id, qid).expect("asked; qed");
 		assert!(q.answer_hash.is_some());
 		Ok(())
 	}
@@ -587,12 +617,12 @@ mod benchmarks {
 		let officer = funded_account::<T>("officer", 0);
 		let setup =
 			setup_to_evaluation::<T>(&officer, TenderKind::Rft, 2, 2, panel_size::<T>())?;
-		do_award::<T>(setup.tender_id, &setup.bidders[0])?;
+		do_award::<T>(setup.tender_id, vec![setup.bidders[0].clone()])?;
 		// The unsuccessful bidder is the one with standing to challenge.
 		let challenger = setup.bidders[1].clone();
 
 		#[extrinsic_call]
-		_(RawOrigin::Signed(challenger), setup.tender_id, [14u8; 32]);
+		_(RawOrigin::Signed(challenger), setup.tender_id, vec![b'g'; T::MaxGroundsLen::get() as usize], None);
 
 		assert_eq!(OpenChallengeCount::<T>::get(setup.tender_id), 1);
 		Ok(())
@@ -604,22 +634,34 @@ mod benchmarks {
 		let officer = funded_account::<T>("officer", 0);
 		let setup =
 			setup_to_evaluation::<T>(&officer, TenderKind::Rft, 2, 2, panel_size::<T>())?;
-		do_award::<T>(setup.tender_id, &setup.bidders[0])?;
+		do_award::<T>(setup.tender_id, vec![setup.bidders[0].clone()])?;
 		TenderChain::<T>::lodge_challenge(
 			RawOrigin::Signed(setup.bidders[1].clone()).into(),
 			setup.tender_id,
-			[14u8; 32],
+			vec![b'g'; T::MaxGroundsLen::get() as usize],
+			None,
 		)?;
 		let origin = T::ChallengeResolverOrigin::try_successful_origin()
 			.map_err(|_| BenchmarkError::Stop("no successful ChallengeResolverOrigin"))?;
 
+		let cid = TenderChain::<T>::challenge_id_for(&setup.tender_id, 0);
+
 		#[extrinsic_call]
-		_(origin as T::RuntimeOrigin, setup.tender_id, 0u32, false, [15u8; 32]);
+		_(
+			origin as T::RuntimeOrigin,
+			setup.tender_id,
+			cid,
+			false,
+			vec![b'r'; T::MaxResolutionLen::get() as usize],
+		);
 
 		assert_eq!(OpenChallengeCount::<T>::get(setup.tender_id), 0);
 		Ok(())
 	}
 
+	/// Worst case: a panel tender awarding every bidder, so execution admits `b`
+	/// pool members and hands `b` awardees to delivery as well as releasing `b`
+	/// bonds.
 	#[benchmark]
 	fn execute_award(b: Linear<1, { T::MaxBidders::get() }>) -> Result<(), BenchmarkError> {
 		start::<T>();
@@ -627,13 +669,9 @@ mod benchmarks {
 		fund::<T>(&officer);
 		let w = T::MaxWeights::get();
 		let setup =
-			setup_to_evaluation::<T>(&officer, TenderKind::Rft, w, b, panel_size::<T>())?;
-		do_award::<T>(setup.tender_id, &setup.bidders[0])?;
-		// Standstill runs from the award, which happened at `opening_end`.
-		let after = opening_end::<T>()
-			.saturating_add(STANDSTILL.into())
-			.saturating_add(One::one());
-		advance_to_bn::<T>(after);
+			setup_to_evaluation::<T>(&officer, TenderKind::Panel, w, b, panel_size::<T>())?;
+		do_award::<T>(setup.tender_id, setup.bidders.clone())?;
+		past_standstill::<T>();
 
 		#[extrinsic_call]
 		_(RawOrigin::Signed(officer), setup.tender_id, [16u8; 32]);
@@ -668,12 +706,19 @@ mod benchmarks {
 		start::<T>();
 		let officer: T::AccountId = whitelisted_caller();
 		fund::<T>(&officer);
-		// A Panel award admits its awardees to the standing-offer pool.
+		// A Panel award admits its awardees to the standing-offer pool once it
+		// is executed after standstill.
 		let setup =
 			setup_to_evaluation::<T>(&officer, TenderKind::Panel, 2, 1, panel_size::<T>())?;
 		let supplier = setup.bidders[0].clone();
-		do_award::<T>(setup.tender_id, &supplier)?;
-		let panel_id: T::PanelId = NextTenderId::<T>::get().saturating_sub(1).into();
+		do_award::<T>(setup.tender_id, vec![supplier.clone()])?;
+		past_standstill::<T>();
+		TenderChain::<T>::execute_award(
+			RawOrigin::Signed(officer.clone()).into(),
+			setup.tender_id,
+			[16u8; 32],
+		)?;
+		let panel_id = TenderChain::<T>::panel_id_of(&setup.tender_id);
 
 		#[extrinsic_call]
 		_(RawOrigin::Signed(officer), panel_id, supplier.clone(), [18u8; 32]);
@@ -702,12 +747,14 @@ mod benchmarks {
 		start::<T>();
 		let officer = funded_account::<T>("officer", 0);
 		// Open bidding is confined to RFQs (spec §1.2).
-		let raw = NextTenderId::<T>::get();
+		let id = next_tender_id::<T>(&officer);
 		TenderChain::<T>::create_tender(
 			RawOrigin::Signed(officer.clone()).into(),
 			officer.clone(),
 			TenderKind::Rfq,
 			BidMode::Open,
+			vec![b'x'; T::MaxTitleLen::get() as usize],
+			vec![b'x'; T::MaxSummaryLen::get() as usize],
 			[1u8; 32],
 			[2u8; 32],
 			criteria(2),
@@ -723,7 +770,6 @@ mod benchmarks {
 			false,
 			None,
 		)?;
-		let id: T::TenderId = raw.into();
 		TenderChain::<T>::publish_tender(RawOrigin::Signed(officer).into(), id)?;
 
 		let bidder: T::AccountId = whitelisted_caller();
@@ -759,6 +805,39 @@ mod benchmarks {
 		}
 
 		assert!(DeadlineWheel::<T>::get(target).is_empty());
+		Ok(())
+	}
+
+	#[benchmark]
+	fn amend_criteria(w: Linear<1, { T::MaxWeights::get() }>) -> Result<(), BenchmarkError> {
+		start::<T>();
+		let officer: T::AccountId = whitelisted_caller();
+		fund::<T>(&officer);
+		let id = create::<T>(&officer, TenderKind::Rft, T::MaxWeights::get())?;
+
+		#[extrinsic_call]
+		_(RawOrigin::Signed(officer), id, [22u8; 32], criteria(w));
+
+		let t = Tenders::<T>::get(id).expect("created; qed");
+		assert_eq!(t.weights.len() as u32, w);
+		Ok(())
+	}
+
+	#[benchmark]
+	fn set_policy() -> Result<(), BenchmarkError> {
+		let origin = T::PolicyOrigin::try_successful_origin()
+			.map_err(|_| BenchmarkError::Stop("no successful PolicyOrigin"))?;
+		let policy = ProcurementPolicy {
+			min_standstill: 1u32.into(),
+			min_submission_period: 1u32.into(),
+			addendum_response_window: 1u32.into(),
+			max_close_extension: Some(100u32.into()),
+		};
+
+		#[extrinsic_call]
+		_(origin as T::RuntimeOrigin, policy);
+
+		assert_eq!(Policy::<T>::get(), policy);
 		Ok(())
 	}
 
